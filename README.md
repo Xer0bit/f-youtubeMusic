@@ -19,6 +19,9 @@
 
 </div>
 
+
+![alt text](docs/image.png)
+
 ## ✨ Features
 
 ### 🎼 Multi-Platform Support
