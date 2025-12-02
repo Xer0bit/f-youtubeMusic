@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =============================================================================
-# 🎵 BULK MUSIC DOWNLOADER - APP ENTRY POINT
+# BULK MUSIC DOWNLOADER v4.0 - APP ENTRY POINT
 # =============================================================================
 # Main application launcher for the Gradio web UI.
 #
@@ -9,24 +9,26 @@
 #
 # Environment Variables:
 #   MUSIC_DL_ROOT     - Root directory for downloads (default: ~/music_downloads)
-#   MUSIC_DL_WORKERS  - Number of concurrent workers (default: 4)
-#   MUSIC_DL_TIMEOUT  - Socket timeout in seconds (default: 30)
+#   MUSIC_DL_WORKERS  - Number of concurrent workers (default: 8)
+#   MUSIC_DL_TIMEOUT  - Socket timeout in seconds (default: 15)
 #
 # =============================================================================
 
 import sys
 from pathlib import Path
 
-# Add utils to path
-sys.path.insert(0, str(Path(__file__).parent / "utils"))
+# Add project root to path for proper imports
+project_root = str(Path(__file__).parent)
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
-from downloader import create_ui, logger, MAX_WORKERS, SOCKET_TIMEOUT, BASE_DIR
+from utils.downloader import create_ui, logger, MAX_WORKERS, SOCKET_TIMEOUT, BASE_DIR
 
 
 def main():
     """Main entry point."""
     print("\n" + "=" * 70)
-    print("BULK MUSIC DOWNLOADER - PRODUCTION BUILD")
+    print("BULK MUSIC DOWNLOADER v4.0 - PRODUCTION BUILD")
     print("=" * 70)
     print("\nConfiguration:")
     print(f"   Workers:        {MAX_WORKERS}")
@@ -35,10 +37,12 @@ def main():
     print("\nWeb Interface:")
     print("   Open http://0.0.0.0:7860 in your browser")
     print("\nFeatures:")
+    print("   - Proxy support with IP detection")
+    print("   - Genre categorization")
+    print("   - Song catalog with unique IDs")
+    print("   - Embedded file browser / terminal")
     print("   - Multi-threaded concurrent downloads")
     print("   - Archive-based duplicate prevention")
-    print("   - Robust error handling & recovery")
-    print("   - ZIP download on completion")
     print("\n" + "=" * 70 + "\n")
 
     try:

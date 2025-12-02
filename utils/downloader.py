@@ -1,7 +1,7 @@
 # =============================================================================
-# BULK MUSIC DOWNLOADER - HIGH PERFORMANCE ENGINE v3.0
+# BULK MUSIC DOWNLOADER - HIGH PERFORMANCE ENGINE v4.0
 # =============================================================================
-# This module powers the streaming downloader used by the Gradio UI.
+# Features: Proxy support | Genre categorization | Song catalog | File browser
 # =============================================================================
 
 import json
@@ -16,6 +16,12 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
+
+# Import new modules
+from utils.proxy import proxy_manager, ProxyConfig
+from utils.catalog import music_catalog, SongEntry
+from utils.filebrowser import file_browser
+from utils.spotify import spotify_manager, is_spotify_url, parse_spotify_input
 
 # =============================================================================
 # CONFIGURATION
@@ -160,6 +166,11 @@ class UserDataManager:
             except Exception:
                 pass
 
+    def update_setting(self, key: str, value: Any) -> None:
+        """Update a single setting."""
+        self.settings[key] = value
+        self.save_settings()
+
     def _load_history(self) -> List[DownloadSession]:
         if not os.path.exists(HISTORY_FILE):
             return []
@@ -219,6 +230,18 @@ class MusicDownloader:
         self.current_session: Optional[DownloadSession] = None
         self.user_data = UserDataManager()
         self._yt_dlp: Any = None
+        self.custom_output_dir: Optional[str] = None  # Custom save location
+
+    def set_output_directory(self, path: str) -> str:
+        """Set custom output directory."""
+        if os.path.isdir(path):
+            self.custom_output_dir = path
+            return f"Output directory set to: {path}"
+        return f"Error: Invalid directory: {path}"
+
+    def get_output_directory(self) -> str:
+        """Get current output directory."""
+        return self.custom_output_dir or BASE_DIR
 
     def _get_yt_dlp(self):
         if self._yt_dlp is None:
@@ -262,10 +285,19 @@ class MusicDownloader:
         if len(items) == 1:
             item = items[0]
             if item.startswith(("http://", "https://")):
+                # Check for Spotify URLs
+                if is_spotify_url(item):
+                    if "playlist" in item or "album" in item:
+                        return "Spotify Playlist/Album"
+                    return "Spotify Track"
                 if any(token in item.lower() for token in ["list=", "playlist", "/sets/"]):
                     return "Playlist URL"
                 return "Single URL"
             return "Search query"
+        # Check for mixed Spotify content
+        spotify_count = sum(1 for i in items if is_spotify_url(i))
+        if spotify_count > 0:
+            return f"Batch: {len(items)} items ({spotify_count} Spotify)"
         return f"Batch: {len(items)} items"
 
     def _extract_playlist_urls(self, url: str) -> List[Dict[str, Any]]:
@@ -352,6 +384,10 @@ class MusicDownloader:
             "writethumbnail": embed_thumb,
             "postprocessor_args": {"ffmpeg": ["-threads", "4"]},
         }
+        # Apply proxy settings if configured
+        proxy_opts = proxy_manager.get_yt_dlp_opts()
+        opts.update(proxy_opts)
+        
         if embed_thumb:
             opts["postprocessors"].extend([
                 {"key": "EmbedThumbnail"},
@@ -365,6 +401,25 @@ class MusicDownloader:
                     item.artist = info.get("artist", info.get("uploader", ""))
                     item.duration = info.get("duration", 0)
                     item.status = DownloadStatus.COMPLETED
+                    
+                    # Add to catalog with genre detection
+                    file_path = os.path.join(output_dir, f"{item.title}.mp3")
+                    metadata = {
+                        "source_url": url,
+                        "uploader": info.get("uploader", ""),
+                        "upload_date": info.get("upload_date", ""),
+                        "description": info.get("description", "")[:200] if info.get("description") else "",
+                        "tags": info.get("tags", []),
+                        "categories": info.get("categories", []),
+                    }
+                    music_catalog.add_song(
+                        title=item.title,
+                        artist=item.artist,
+                        file_path=file_path,
+                        source_url=url,
+                        info=metadata
+                    )
+                    
                     return True, item.title
                 return False, "No info extracted"
         except yt_dlp.utils.DownloadError as error:
@@ -395,7 +450,8 @@ class MusicDownloader:
             yield self._format_progress(), "No items", None
             return
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = os.path.join(BASE_DIR, f"batch_{timestamp}")
+        base_output = self.custom_output_dir or BASE_DIR
+        output_dir = os.path.join(base_output, f"batch_{timestamp}")
         os.makedirs(output_dir, exist_ok=True)
         self.log(f"Analyzing {len(raw_items)} inputs", "INFO")
         yield self._format_progress(), "Extracting playlist information...", None
@@ -617,12 +673,285 @@ def update_settings(quality, embed_thumb, auto_zip, max_history):
     return "Settings saved!"
 
 
+# =============================================================================
+# NETWORK / PROXY FUNCTIONS
+# =============================================================================
+
+def get_network_info():
+    """Get current network and IP information."""
+    info = proxy_manager.get_network_info()
+    lines = [
+        "Network Information",
+        "=" * 40,
+        f"Current IP: {info.get('current_ip', 'Unknown')}",
+        f"Location: {info.get('location', 'Unknown')}",
+        f"ISP: {info.get('isp', 'Unknown')}",
+        "",
+        "Proxy Status",
+        "-" * 40,
+    ]
+    if proxy_manager.config:
+        lines.append(f"Type: {proxy_manager.config.proxy_type}")
+        lines.append(f"Host: {proxy_manager.config.host}:{proxy_manager.config.port}")
+        lines.append(f"Enabled: {'Yes' if proxy_manager.config.enabled else 'No'}")
+    else:
+        lines.append("No proxy configured")
+    return "\n".join(lines)
+
+
+def configure_proxy(proxy_type, host, port, username, password, enabled):
+    """Configure proxy settings."""
+    try:
+        port_int = int(port) if port else 0
+        if not host or port_int <= 0:
+            # Leave a valid ProxyConfig with enabled=False so ProxyManager methods stay safe
+            proxy_manager.config = ProxyConfig(enabled=False)
+            proxy_manager.save_config()
+            return "Proxy disabled (empty configuration)"
+        
+        config = ProxyConfig(
+            proxy_type=proxy_type,
+            host=host,
+            port=port_int,
+            username=username if username else None,
+            password=password if password else None,
+            enabled=enabled
+        )
+        proxy_manager.config = config
+        proxy_manager.save_config()
+        return f"Proxy configured: {proxy_type}://{host}:{port}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def test_proxy_connection():
+    """Test proxy connection."""
+    if not proxy_manager.config or not proxy_manager.config.enabled:
+        return "No proxy configured"
+
+    success, message = proxy_manager.test_proxy()
+    return f"Test Result: {'SUCCESS' if success else 'FAILED'}\n{message}"
+
+
+# =============================================================================
+# CATALOG FUNCTIONS
+# =============================================================================
+
+def get_catalog_stats():
+    """Get catalog statistics."""
+    stats = music_catalog.get_statistics()
+    lines = [
+        "Music Catalog Statistics",
+        "=" * 40,
+        f"Total Songs: {stats['total_songs']}",
+        f"Total Artists: {stats['total_artists']}",
+        f"Total Duration: {stats['total_duration_formatted']}",
+        "",
+        "Genres",
+        "-" * 40,
+    ]
+    for genre, count in sorted(stats['genres'].items(), key=lambda x: -x[1])[:15]:
+        lines.append(f"  {genre}: {count}")
+    return "\n".join(lines)
+
+
+def search_catalog(query):
+    """Search songs in catalog."""
+    if not query.strip():
+        return "Enter a search query"
+    results = music_catalog.search_songs(query)
+    if not results:
+        return f"No songs found matching '{query}'"
+    
+    lines = [f"Found {len(results)} songs:"]
+    for song in results[:30]:
+        duration = f"{song.duration // 60}:{song.duration % 60:02d}" if song.duration else "?"
+        lines.append(f"  [{song.unique_id[:8]}] {song.title} - {song.artist} ({duration}) [{song.genre}]")
+    return "\n".join(lines)
+
+
+def get_songs_by_genre(genre):
+    """Get songs filtered by genre."""
+    songs = music_catalog.get_songs_by_genre(genre)
+    if not songs:
+        return f"No songs in genre: {genre}"
+    
+    lines = [f"Genre: {genre} ({len(songs)} songs)"]
+    for song in songs[:50]:
+        duration = f"{song.duration // 60}:{song.duration % 60:02d}" if song.duration else "?"
+        lines.append(f"  {song.title} - {song.artist} ({duration})")
+    return "\n".join(lines)
+
+
+def organize_catalog_by_genre(base_path):
+    """Organize files by genre."""
+    if not base_path.strip():
+        base_path = os.path.join(BASE_DIR, "organized_by_genre")
+    
+    from utils.catalog import organize_by_genre
+    result = organize_by_genre(base_path, music_catalog)
+    return result
+
+
+def get_genre_list():
+    """Get list of available genres."""
+    stats = music_catalog.get_statistics()
+    genres = list(stats.get('genres', {}).keys())
+    return genres if genres else ["Unknown"]
+
+
+# =============================================================================
+# FILE BROWSER FUNCTIONS  
+# =============================================================================
+
+def execute_terminal_command(command):
+    """Execute command in file browser."""
+    return file_browser.execute_command(command)
+
+
+def get_current_directory():
+    """Get current directory path."""
+    return file_browser.pwd()
+
+
+def browse_directory(path):
+    """Browse to a directory and list contents."""
+    if path:
+        file_browser.cd(path)
+    return file_browser.ls()
+
+
+def set_download_location(path):
+    """Set download location."""
+    result = downloader.set_output_directory(path)
+    file_browser.cd(path)
+    return result
+
+
+def get_directory_tree():
+    """Get directory tree."""
+    return file_browser.tree(max_depth=3)
+
+
+def create_folder(name):
+    """Create new folder."""
+    return file_browser.mkdir(name)
+
+
+# =============================================================================
+# SPOTIFY FUNCTIONS
+# =============================================================================
+
+def get_spotify_status():
+    """Get Spotify downloader status."""
+    status = spotify_manager.get_status()
+    lines = [
+        "Spotify Downloader Status",
+        "=" * 40,
+        f"spotdl installed: {'Yes' if status['spotdl_installed'] else 'No - Install with: pip install spotdl'}",
+        f"Currently downloading: {'Yes' if status['is_downloading'] else 'No'}",
+        "",
+        "Session Statistics",
+        "-" * 40,
+        f"Completed: {status['stats']['completed']}",
+        f"Failed: {status['stats']['failed']}",
+        f"Total: {status['stats']['total']}",
+    ]
+    return "\n".join(lines)
+
+
+def download_spotify_streaming(url_text: str, audio_format: str, audio_quality: str):
+    """Download Spotify tracks/playlists with streaming progress."""
+    if not url_text.strip():
+        yield "Enter Spotify URLs or search queries!", "No items"
+        return
+    
+    if not spotify_manager.is_spotdl_installed():
+        yield "spotdl not installed!\n\nInstall it with:\npip install spotdl", "Install spotdl first"
+        return
+    
+    # Parse input
+    items = parse_spotify_input(url_text)
+    if not items:
+        yield "No valid items found", "No items"
+        return
+    
+    # Set output directory
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(downloader.get_output_directory(), f"spotify_{timestamp}")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    spotify_manager.log(f"Starting Spotify download: {len(items)} items")
+    spotify_manager.log(f"Output: {output_dir}")
+    spotify_manager.log(f"Format: {audio_format} @ {audio_quality}")
+    
+    progress_lines = [f"Downloading {len(items)} item(s) to {output_dir}"]
+    status_lines = []
+    
+    # Check if batch or single
+    if len(items) == 1 and is_spotify_url(items[0]):
+        # Single URL download
+        for update in spotify_manager.download_url(items[0], output_dir, audio_format, audio_quality):
+            status = update.get("status", "")
+            message = update.get("message", "")
+            
+            if status == "completed":
+                progress_lines.append(f"\n{message}")
+                status_lines.append("[COMPLETED] " + message)
+            elif status == "error":
+                progress_lines.append(f"\n[ERROR] {message}")
+                status_lines.append("[FAILED] " + message)
+            elif status == "downloading":
+                current = update.get("current_track", "")
+                status_lines.append(f"[DOWNLOADING] {current}")
+            elif status == "info":
+                progress_lines.append(message)
+            
+            logs = spotify_manager.get_logs(15)
+            yield "\n".join(progress_lines) + "\n\n" + logs, "\n".join(status_lines[-20:])
+    else:
+        # Batch download (multiple URLs or search queries)
+        for update in spotify_manager.download_batch(items, output_dir, audio_format, audio_quality):
+            status = update.get("status", "")
+            message = update.get("message", "")
+            batch_progress = update.get("batch_progress", "")
+            
+            if status == "batch_completed":
+                completed = update.get("completed", 0)
+                failed = update.get("failed", 0)
+                progress_lines.append(f"\nBatch complete! {completed} downloaded, {failed} failed")
+            elif status == "completed":
+                status_lines.append(f"[COMPLETED] [{batch_progress}] {message}")
+            elif status == "error":
+                status_lines.append(f"[FAILED] [{batch_progress}] {message}")
+            elif status == "downloading":
+                current = update.get("current_track", "")
+                status_lines.append(f"[DOWNLOADING] [{batch_progress}] {current}")
+            
+            logs = spotify_manager.get_logs(15)
+            yield "\n".join(progress_lines) + "\n\n" + logs, "\n".join(status_lines[-20:])
+    
+    yield "\n".join(progress_lines) + "\n\nDownload complete!", "\n".join(status_lines[-20:])
+
+
+def stop_spotify_download():
+    """Stop Spotify download."""
+    spotify_manager.stop_download()
+    return "Download stopped!", "Stopped by user"
+
+
+def get_spotify_logs():
+    """Get Spotify download logs."""
+    return spotify_manager.get_logs(30)
+
+
 def create_ui():
     gr = _import_gradio()
-    with gr.Blocks(title="Music Downloader v3.0") as app:
+    with gr.Blocks(title="Music Downloader v5.0") as app:
         gr.Markdown(
-            "# High-Performance Music Downloader v3.0\n"
-            "**Features:** 8x concurrent downloads | Playlist extraction | Real-time progress | Auto ZIP"
+            "# High-Performance Music Downloader v5.0\n"
+            "**Features:** Spotify support | Proxy | Genre categorization | Song catalog | File browser"
         )
         with gr.Tabs():
             with gr.TabItem("Download"):
@@ -664,6 +993,67 @@ def create_ui():
                             lines=12,
                             interactive=False,
                         )
+            
+            # =====================================================================
+            # SPOTIFY TAB - Spotify Downloads
+            # =====================================================================
+            with gr.TabItem("Spotify"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        gr.Markdown(
+                            "### Spotify Downloader\n"
+                            "Download tracks, albums, and playlists from Spotify.\n\n"
+                            "**Supported URLs:**\n"
+                            "- `https://open.spotify.com/track/...`\n"
+                            "- `https://open.spotify.com/album/...`\n"
+                            "- `https://open.spotify.com/playlist/...`\n"
+                            "- Or search: `Artist - Song`"
+                        )
+                        spotify_input = gr.Textbox(
+                            label="Spotify URLs / Search Queries",
+                            placeholder=(
+                                "Paste Spotify URLs or search queries (one per line)\n\n"
+                                "Examples:\n"
+                                "https://open.spotify.com/track/...\n"
+                                "https://open.spotify.com/playlist/...\n"
+                                "Drake - God's Plan\n"
+                                "The Weeknd - Blinding Lights"
+                            ),
+                            lines=8,
+                        )
+                        with gr.Row():
+                            spotify_format = gr.Dropdown(
+                                choices=["mp3", "m4a", "flac", "opus", "ogg", "wav"],
+                                value="mp3",
+                                label="Audio Format"
+                            )
+                            spotify_quality = gr.Dropdown(
+                                choices=["128k", "192k", "256k", "320k"],
+                                value="320k",
+                                label="Audio Quality"
+                            )
+                        with gr.Row():
+                            spotify_download_btn = gr.Button("Download from Spotify", variant="primary", size="lg")
+                            spotify_stop_btn = gr.Button("Stop", variant="stop")
+                    with gr.Column(scale=1):
+                        spotify_progress = gr.Textbox(
+                            label="Progress",
+                            lines=12,
+                            interactive=False,
+                        )
+                        spotify_status = gr.Textbox(
+                            label="Track Status",
+                            lines=12,
+                            interactive=False,
+                        )
+                with gr.Row():
+                    spotify_info = gr.Textbox(
+                        label="Spotify Status",
+                        lines=6,
+                        interactive=False,
+                        value=get_spotify_status()
+                    )
+                    refresh_spotify_btn = gr.Button("Refresh Status")
             with gr.TabItem("History"):
                 with gr.Row():
                     with gr.Column():
@@ -724,12 +1114,132 @@ def create_ui():
                             "- Each track shows real-time download progress\n"
                             "- Already downloaded tracks are automatically skipped"
                         )
+            
+            # =====================================================================
+            # NETWORK TAB - Proxy Configuration
+            # =====================================================================
+            with gr.TabItem("Network"):
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("### Proxy Configuration")
+                        proxy_type = gr.Dropdown(
+                            choices=["http", "https", "socks4", "socks5"],
+                            value="http",
+                            label="Proxy Type"
+                        )
+                        proxy_host = gr.Textbox(label="Host", placeholder="proxy.example.com")
+                        proxy_port = gr.Textbox(label="Port", placeholder="8080")
+                        proxy_user = gr.Textbox(label="Username (optional)", placeholder="user")
+                        proxy_pass = gr.Textbox(label="Password (optional)", type="password")
+                        proxy_enabled = gr.Checkbox(value=True, label="Enable Proxy")
+                        with gr.Row():
+                            apply_proxy_btn = gr.Button("Apply Proxy", variant="primary")
+                            test_proxy_btn = gr.Button("Test Connection")
+                        proxy_status = gr.Textbox(label="Status", lines=2, interactive=False)
+                    with gr.Column():
+                        gr.Markdown("### Network Information")
+                        network_info = gr.Textbox(
+                            label="Current Network Status",
+                            lines=15,
+                            interactive=False,
+                            value=get_network_info()
+                        )
+                        refresh_network_btn = gr.Button("Refresh IP Info")
+            
+            # =====================================================================
+            # CATALOG TAB - Music Library
+            # =====================================================================
+            with gr.TabItem("Catalog"):
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("### Music Catalog")
+                        catalog_stats = gr.Textbox(
+                            label="Catalog Statistics",
+                            lines=15,
+                            interactive=False,
+                            value=get_catalog_stats()
+                        )
+                        refresh_catalog_btn = gr.Button("Refresh Stats")
+                    with gr.Column():
+                        gr.Markdown("### Search Songs")
+                        search_input = gr.Textbox(label="Search", placeholder="Artist, title, or genre...")
+                        search_btn = gr.Button("Search")
+                        search_results = gr.Textbox(label="Results", lines=12, interactive=False)
+                        
+                        gr.Markdown("### Filter by Genre")
+                        genre_dropdown = gr.Dropdown(
+                            choices=get_genre_list(),
+                            label="Select Genre"
+                        )
+                        filter_genre_btn = gr.Button("Filter")
+                        genre_results = gr.Textbox(label="Songs", lines=8, interactive=False)
+                with gr.Row():
+                    gr.Markdown("### Organize Files by Genre")
+                    organize_path = gr.Textbox(
+                        label="Output Path",
+                        placeholder="Leave empty for default location",
+                        value=""
+                    )
+                    organize_btn = gr.Button("Organize by Genre")
+                    organize_status = gr.Textbox(label="Status", lines=2, interactive=False)
+            
+            # =====================================================================
+            # FILE BROWSER TAB - Terminal Interface
+            # =====================================================================
+            with gr.TabItem("File Browser"):
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("### Terminal")
+                        current_dir_display = gr.Textbox(
+                            label="Current Directory",
+                            value=get_current_directory(),
+                            interactive=False
+                        )
+                        terminal_input = gr.Textbox(
+                            label="Command",
+                            placeholder="Type command (ls, cd, mkdir, pwd, tree, find, help...)"
+                        )
+                        execute_btn = gr.Button("Execute", variant="primary")
+                        terminal_output = gr.Textbox(
+                            label="Output",
+                            lines=15,
+                            interactive=False,
+                            value=file_browser.ls()
+                        )
+                    with gr.Column():
+                        gr.Markdown("### Quick Actions")
+                        new_folder_name = gr.Textbox(label="New Folder Name", placeholder="my_folder")
+                        create_folder_btn = gr.Button("Create Folder")
+                        folder_status = gr.Textbox(label="Status", lines=1, interactive=False)
+                        
+                        gr.Markdown("### Set Download Location")
+                        download_loc_input = gr.Textbox(
+                            label="Download Path",
+                            placeholder="/home/user/Music",
+                            value=downloader.get_output_directory()
+                        )
+                        set_location_btn = gr.Button("Set as Download Location", variant="primary")
+                        location_status = gr.Textbox(label="Status", lines=1, interactive=False)
+                        
+                        gr.Markdown("### Directory Tree")
+                        tree_output = gr.Textbox(label="Tree View", lines=10, interactive=False)
+                        show_tree_btn = gr.Button("Show Tree")
         download_btn.click(
             fn=download_music_streaming,
             inputs=[url_input, quality, embed_thumb],
             outputs=[progress_output, items_output, zip_output],
         )
         stop_btn.click(fn=stop_download, outputs=[progress_output, items_output])
+        
+        # Spotify tab events
+        spotify_download_btn.click(
+            fn=download_spotify_streaming,
+            inputs=[spotify_input, spotify_format, spotify_quality],
+            outputs=[spotify_progress, spotify_status]
+        )
+        spotify_stop_btn.click(fn=stop_spotify_download, outputs=[spotify_progress, spotify_status])
+        refresh_spotify_btn.click(fn=get_spotify_status, outputs=[spotify_info])
+        
         refresh_history.click(fn=get_history, outputs=[history_output])
         clear_history_btn.click(fn=clear_history, outputs=[history_output])
         refresh_stats.click(fn=get_statistics, outputs=[stats_output])
@@ -740,6 +1250,37 @@ def create_ui():
             inputs=[s_quality, s_thumb, s_zip, s_history],
             outputs=[save_status],
         )
+        
+        # Network tab events
+        apply_proxy_btn.click(
+            fn=configure_proxy,
+            inputs=[proxy_type, proxy_host, proxy_port, proxy_user, proxy_pass, proxy_enabled],
+            outputs=[proxy_status]
+        )
+        test_proxy_btn.click(fn=test_proxy_connection, outputs=[proxy_status])
+        refresh_network_btn.click(fn=get_network_info, outputs=[network_info])
+        
+        # Catalog tab events
+        refresh_catalog_btn.click(fn=get_catalog_stats, outputs=[catalog_stats])
+        search_btn.click(fn=search_catalog, inputs=[search_input], outputs=[search_results])
+        filter_genre_btn.click(fn=get_songs_by_genre, inputs=[genre_dropdown], outputs=[genre_results])
+        organize_btn.click(fn=organize_catalog_by_genre, inputs=[organize_path], outputs=[organize_status])
+        
+        # File browser tab events
+        def run_command_and_update(cmd):
+            output = execute_terminal_command(cmd)
+            current = get_current_directory()
+            return output, current
+        
+        execute_btn.click(
+            fn=run_command_and_update,
+            inputs=[terminal_input],
+            outputs=[terminal_output, current_dir_display]
+        )
+        create_folder_btn.click(fn=create_folder, inputs=[new_folder_name], outputs=[folder_status])
+        set_location_btn.click(fn=set_download_location, inputs=[download_loc_input], outputs=[location_status])
+        show_tree_btn.click(fn=get_directory_tree, outputs=[tree_output])
+        
         app.load(fn=get_file_list, outputs=[file_output])
         app.load(fn=get_history, outputs=[history_output])
         app.load(fn=get_statistics, outputs=[stats_output])
@@ -748,10 +1289,17 @@ def create_ui():
 
 if __name__ == "__main__":
     print("\n" + "=" * 60)
-    print("HIGH-PERFORMANCE MUSIC DOWNLOADER v3.0")
+    print("HIGH-PERFORMANCE MUSIC DOWNLOADER v5.0")
     print("=" * 60)
     print(f"\nWorkers: {MAX_WORKERS} | Timeout: {SOCKET_TIMEOUT}s")
     print(f"Output: {BASE_DIR}")
+    print("\nFeatures:")
+    print("  - Spotify tracks, albums & playlists")
+    print("  - YouTube videos & playlists")
+    print("  - Proxy support with IP detection")
+    print("  - Genre categorization")
+    print("  - Song catalog with unique IDs")
+    print("  - File browser / Terminal")
     print("\nOpen: http://0.0.0.0:7860\n")
     app = create_ui()
     app.launch(
