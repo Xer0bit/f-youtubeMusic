@@ -37,6 +37,7 @@ brew install ffmpeg
 # Download from https://ffmpeg.org/download.html
 ```
 
+![alt text](docs/image.png)
 ### 2. Run the Application
 
 ```bash
