@@ -1,6 +1,8 @@
-# 🎵 Bulk Music Downloader
+# 🎵 Bulk Music Downloader (Youtube music, SoundCloud)
 
 A **production-ready**, **multi-threaded** music downloader with a modern web UI for batch downloading from YouTube, SoundCloud, and 1000+ sites.
+
+![alt text](docs/image.png)
 
 ## ✨ Key Features
 
@@ -37,7 +39,6 @@ brew install ffmpeg
 # Download from https://ffmpeg.org/download.html
 ```
 
-![alt text](docs/image.png)
 ### 2. Run the Application
 
 ```bash
